@@ -38,12 +38,15 @@ from email.mime.text import MIMEText
 from logging import getLogger
 from smtplib import SMTP, SMTP_SSL
 from threading import Thread
-from time import time
+from time import time, time_ns
 import bottle
 import os
 import re
 import shutil
 import uuid
+import brotli
+import json
+import traceback
 
 try:
     import json
@@ -64,6 +67,219 @@ class AAAException(Exception):
 class AuthException(AAAException):
     """Authentication Exception: incorrect username/password pair"""
     pass
+
+class PostgresTable(dict):
+    def __init__(self, connection, postgres_table_name, table_name):
+        """ Wrapper class to manage a table of postgres entries
+
+        :param connection: postgres connection
+        :type connection: psycopg2.connection
+        :param table_name: the name (aka prefix) of the table entries
+        :type table_name: str.
+        """
+        self.connection = connection
+        self.postgres_table_name = postgres_table_name
+        self.table_name = table_name
+
+    def _get_entry_key(self, item):
+        return "%s:%s" % (self.table_name, item)
+
+    def _decompress(self, value):
+        header = value[0]
+        if header != 0:
+            raise Exception("Invalid compressed object")
+        return brotli.decompress(value[1:])
+
+    def _compress(self, value):
+        return b"\x00" + brotli.compress(value, quality=5)
+
+    def _should_compress(self, value):
+        return len(value) > 4096
+
+    def _get_value_bytes(self, value):
+        value_bytes = json.dumps(value).encode("utf-8")
+        if self._should_compress(value_bytes):
+            return True, self._compress(value_bytes)
+        return False, value_bytes
+
+    def _convert_to_value(self, value, compressed):
+        if compressed:
+            value = self._decompress(value)
+        return json.loads(value)
+
+    def _get_ttl(self, expiry):
+        if expiry is not None and expiry > 0:
+            return expiry - int(time.time() * 1000)
+        return None
+    
+    def _get_expiry(self, ttl):
+        if ttl is not None and ttl > 0:
+            return int(time.time() * 1000) + (ttl * 1000)
+        return -1
+
+    def _get_from_postgres(self, key):
+        """Get a document by key. Returns value or raises KeyError."""
+        with self._connection.cursor() as cursor:
+            try:
+                cursor.execute("SELECT value, compressed, ttl FROM %s WHERE id = %%s" % self.postgres_table_name, (key,))
+                results = cursor.fetchall()
+            except Exception as e:
+                traceback.print_exc()
+                raise e
+            finally:
+                cursor.close()
+            if len(results) == 0:
+                raise KeyError()
+            result_row = results[0]
+            result_ttl = self._get_ttl(result_row[2])
+            if result_ttl is not None and result_ttl <= 0:
+                raise KeyError()
+            value = self._convert_to_value(result_row[0], result_row[2])
+            return value
+
+    def _set_in_postgres(self, key, value, ttl=None):
+        """Set (upsert) a document."""
+        new_cas = time.time_ns()
+        compressed, value_bytes = self._get_value_bytes(value)
+        expiry = self._get_expiry(ttl)
+        with self._connection.cursor() as cursor:
+            try:
+                query_string = (
+                    "INSERT INTO %s (id, value, cas, compressed, expiry) " \
+                    "VALUES (%%s, %%s, %%s, %%s, %%s) ON CONFLICT (id) " \
+                    "DO UPDATE SET value = EXCLUDED.value, cas = EXCLUDED.cas, compressed = EXCLUDED.compressed, expiry = EXCLUDED.expiry"
+                )
+                cursor.execute(
+                    query_string % self.postgres_table_name,
+                    (key, value_bytes, new_cas, compressed, expiry)
+                )
+            except:
+                traceback.print_exc()
+            finally:
+                cursor.close()
+
+    def _remove_from_postgres(self, key, cas=None):
+        """Remove a document."""
+        with self._connection.cursor() as cursor:
+            try:
+                cursor.execute(
+                    "DELETE FROM %s WHERE id = %%s" % self.postgres_table_name,
+                    (key,)
+                )
+            except:
+                traceback.print_exc()
+            finally:
+                cursor.close()
+
+    def __contains__(self, item):
+        try:
+            self._get_from_postgres(self._get_entry_key(item))
+            return True
+        except KeyError:
+            return False
+
+    def __getitem__(self, item):
+        return self._get_from_postgres(self._get_entry_key(item))
+
+    def __setitem__(self, key, value):
+        self._set_in_postgres(self._get_entry_key(key), value)
+
+    def __delitem__(self, item):
+        self._remove_from_postgres(self._get_entry_key(item))
+
+    def pop(self, item):
+        value = self._get_from_postgres(self._get_entry_key(item))
+        self._remove_from_postgres(self._get_entry_key(item))
+        return value
+
+    def _get_keys(self, include_docs=False):
+        """Get items by table name."""
+        query = "SELECT id FROM %s WHERE id like '%s:%%'" % (self.postgres_table_name, self.table_name)
+        if include_docs:
+            query = "SELECT id, value, compressed FROM %s WHERE id like '%s:%%'" % (self.postgres_table_name, self.table_name)
+        with self._connection.cursor() as cursor:
+            try:
+                cursor.execute(query)
+                table_rows = cursor.fetchall()
+            finally:
+                cursor.close()
+        
+        table_values = []
+        for row in table_rows:
+            doc_id = row[0]
+            value_obj = {"key": doc_id.replace(self.table_name + ":", "")}
+
+            if include_docs:
+                value_obj["document"] = self._convert_to_value(row[1], row[2])
+                continue
+
+            table_values.append(value_obj)
+        return table_values
+
+    def __iter__(self):
+        values = self._get_keys()
+        for item in values:
+            yield item["key"]
+
+    def __len__(self):
+        values = self._get_keys()
+        return len(values)
+
+    def items(self):
+        values = self._get_keys(include_docs=True)
+        yield [(item["key"], item["document"]) for item in values]
+
+    def iteritems(self, *args, **kwargs):
+        values = self._get_keys(include_docs=True)
+        for item in values:
+            yield item["key"], item["document"]
+
+    def keys(self):
+        values = self._get_keys()
+        yield [item["key"] for item in values]
+
+    def iterkeys(self):
+        values = self._get_keys()
+        for item in values:
+            yield item["key"]
+
+    def values(self):
+        values = self._get_keys(include_docs=True)
+        yield [item["document"] for item in values]
+
+    def itervalues(self):
+        values = self._get_keys(include_docs=True)
+        for item in values:
+            yield item["document"]
+
+class PostgresBackend(object):
+
+    def __init__(self, db_host='localhost', db_user='postgres', db_password='', db_name='default', db_table_name='kvstore.kv_store', users_table_name='User',
+            roles_table_name='Role', pending_reg_table_name='Register'):
+        """Data storage class. Handles JSON Docs in Couchbase
+
+        :param db_host: hostname of postgres server to use
+        :type db_host: str.
+        :param db_user: username used to log into postgres server
+        :type db_user: str.
+        :param db_password: password used to log into postgres server
+        :type db_password: str.
+        :param db_name: name of the database to use
+        :type db_name: str.
+        :param db_table_name: name of the table to use
+        :type db_table_name: str.
+        :param users_table_name: prefix for user keys
+        :type users_table_name: str.
+        :param roles_table_name: prefix for role keys
+        :type roles_table_name: str.
+        :param pending_reg_table_name: prefix for pending registration keys
+        :type pending_reg_table_name: str.
+        """
+        import psycopg2
+        self.connection = psycopg2.connect(host=db_host, dbname=db_name, user=db_user, password=db_password, autocommit=True)
+        self.users = PostgresTable(self.connection, db_table_name, users_table_name)
+        self.roles = PostgresTable(self.connection, db_table_name, roles_table_name)
+        self.pending_registrations = PostgresTable(self.connection, db_table_name, pending_reg_table_name)
 
 class CouchbaseTable(dict):
     def __init__(self, bucket, table_name):
@@ -197,8 +413,8 @@ class CouchbaseBackend(object):
 class Cork(object):
 
     def __init__(self, email_sender=None, db_host='localhost', db_password='', db_bucket='default',
-        users_table_name='User', roles_table_name='Role', pending_reg_table_name='Register',
-        session_domain=None, smtp_url='localhost', smtp_server=None):
+        users_table_name='User', roles_table_name='Role', pending_reg_table_name='Register', 
+        postgres_config=None, session_domain=None, smtp_url='localhost', smtp_server=None):
         """Auth/Authorization/Accounting class
 
         :param db_host: hostname of couchbase server to use
@@ -213,11 +429,24 @@ class Cork(object):
         :type roles_table_name: str.
         :param pending_reg_table_name: prefix for pending registration keys
         :type pending_reg_table_name: str.
+        :param postgres_config: configuration for postgres server
+        :type postgres_config: dict.
+        :param session_domain: domain for the session cookie
+        :type session_domain: str.
+        :param smtp_url: URL for the SMTP server
+        :type smtp_url: str.
+        :param smtp_server: SMTP server to use
+        :type smtp_server: str.
         """
         if smtp_server:
             smtp_url = smtp_server
         self.mailer = Mailer(email_sender, smtp_url)
-        self._store = CouchbaseBackend(db_host, db_password, db_bucket, users_table_name,
+        if postgres_config is not None:
+            self._store = PostgresBackend(postgres_config['host'], postgres_config['user'], 
+                postgres_config['password'], postgres_config['dbname'], postgres_config['table_name'],
+                users_table_name, roles_table_name, pending_reg_table_name)
+        else:
+            self._store = CouchbaseBackend(db_host, db_password, db_bucket, users_table_name,
                                        roles_table_name, pending_reg_table_name)
         self.password_reset_timeout = 3600 * 24
         self.session_domain = session_domain

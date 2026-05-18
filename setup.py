@@ -32,6 +32,8 @@ setup(
         'Beaker',
         'couchbase',
         'setuptools',
+        'psycopg2',
+        'brotli',
     ],
     packages = ['cork'],
     platforms = ['Linux'],
